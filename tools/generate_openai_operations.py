@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+import json
+import pathlib
+import re
+import sys
+
+import yaml
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+OPENAPI_PATH = ROOT / "tools" / "openapi.yaml"
+OUTPUT_PATH = ROOT / "src" / "utils" / "openaiOperations.js"
+
+HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+
+
+def normalize_group(value):
+    if not value:
+        return "default"
+    parts = re.split(r"[^A-Za-z0-9]+", str(value))
+    parts = [part for part in parts if part]
+    if not parts:
+        return "default"
+    first = parts[0].lower()
+    return first + "".join(part[:1].upper() + part[1:].lower() for part in parts[1:])
+
+
+def parameter_names(parameters, location):
+    names = []
+    for param in parameters or []:
+        if not isinstance(param, dict):
+            continue
+        if param.get("in") == location and param.get("name"):
+            names.append(param["name"])
+    return names
+
+
+def content_types(section):
+    content = section.get("content") if isinstance(section, dict) else None
+    if not isinstance(content, dict):
+        return []
+    return sorted(content.keys())
+
+
+def has_binary_schema(schema):
+    if not isinstance(schema, dict):
+        return False
+    if schema.get("format") == "binary":
+        return True
+    for key in ("oneOf", "anyOf", "allOf"):
+        values = schema.get(key)
+        if isinstance(values, list) and any(has_binary_schema(item) for item in values):
+            return True
+    props = schema.get("properties")
+    if isinstance(props, dict) and any(has_binary_schema(item) for item in props.values()):
+        return True
+    items = schema.get("items")
+    return has_binary_schema(items)
+
+
+def response_content_types(operation):
+    result = set()
+    for response in (operation.get("responses") or {}).values():
+        if not isinstance(response, dict):
+            continue
+        for content_type in content_types(response):
+            result.add(content_type)
+    return sorted(result)
+
+
+def has_binary_response(operation):
+    for response in (operation.get("responses") or {}).values():
+        if not isinstance(response, dict):
+            continue
+        for content in (response.get("content") or {}).values():
+            if not isinstance(content, dict):
+                continue
+            if has_binary_schema(content.get("schema")):
+                return True
+    return False
+
+
+def beta_header(path, group):
+    if group in {"assistants", "vectorStores"} or path.startswith("/threads"):
+        return "assistants=v2"
+    if path.startswith("/assistants") or path.startswith("/vector_stores"):
+        return "assistants=v2"
+    if path.startswith("/chatkit"):
+        return "chatkit_beta=v1"
+    return ""
+
+
+def main():
+    spec = yaml.safe_load(OPENAPI_PATH.read_text())
+    operations = {}
+    paths = spec.get("paths") or {}
+
+    for path, path_item in paths.items():
+        if not isinstance(path_item, dict):
+            continue
+        path_parameters = path_item.get("parameters") or []
+        for method, operation in path_item.items():
+            if method not in HTTP_METHODS or not isinstance(operation, dict):
+                continue
+            operation_id = operation.get("operationId")
+            if not operation_id:
+                continue
+
+            meta = operation.get("x-oaiMeta") or {}
+            group = normalize_group(meta.get("group") or (operation.get("tags") or ["default"])[0])
+            parameters = list(path_parameters) + list(operation.get("parameters") or [])
+            request_body = operation.get("requestBody") or {}
+            request_types = content_types(request_body)
+            response_types = response_content_types(operation)
+
+            operations[operation_id] = {
+                "id": operation_id,
+                "method": method.upper(),
+                "path": path,
+                "group": group,
+                "metaPath": str(meta.get("path") or ""),
+                "pathParams": parameter_names(parameters, "path"),
+                "queryParams": parameter_names(parameters, "query"),
+                "hasRequestBody": bool(request_body),
+                "requestContentTypes": request_types,
+                "responseContentTypes": response_types,
+                "multipart": "multipart/form-data" in request_types,
+                "streaming": "text/event-stream" in response_types,
+                "binaryResponse": "application/octet-stream" in response_types or has_binary_response(operation),
+                "betaHeader": beta_header(path, group),
+            }
+
+    expected = 242
+    if len(operations) != expected:
+        print(f"expected {expected} OpenAI operations, got {len(operations)}", file=sys.stderr)
+        return 1
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(operations, ensure_ascii=False, indent=2, sort_keys=True)
+    OUTPUT_PATH.write_text(
+        "// Generated by tools/generate_openai_operations.py. Do not edit by hand.\n"
+        f"export const OPENAI_OPERATION_COUNT = {len(operations)}\n"
+        f"export const OPENAI_OPERATIONS = {payload}\n"
+        "export default OPENAI_OPERATIONS\n"
+    )
+    print(f"wrote {OUTPUT_PATH} with {len(operations)} operations")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

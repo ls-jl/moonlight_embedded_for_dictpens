@@ -1,0 +1,4 @@
+#!/bin/sh
+DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export LD_LIBRARY_PATH="$DIR:$DIR/libgamestream:/usr/lib:${LD_LIBRARY_PATH}"
+exec "$DIR/moonlight" "$@"

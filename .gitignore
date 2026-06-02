@@ -1,0 +1,12 @@
+.DS_Store
+*.log
+
+*.amr
+
+api-mock/
+
+# Local screen captures from device testing
+/home-before-restart.png
+/moonlight*.png
+/rgbframe*.png
+/tap-test*.png
