@@ -1,5 +1,7 @@
 # Moonlight Embedded Miniapp for RK3562
 
+[中文说明](README.zh-CN.md)
+
 This project packages a Rockchip RK3562 build of Moonlight Embedded into a Youdao/Falcon miniapp. The miniapp provides a settings page for host pairing and stream options, then enters a blank frame page where the bundled Moonlight binary takes over the DRM framebuffer directly.
 
 ## What Is Included
