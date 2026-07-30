@@ -34,6 +34,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -42,7 +43,7 @@
 
 #include <rockchip/rk_mpi.h>
 
-#define MAX_FRAMES 3
+#define MAX_FRAMES 6
 #define RK_H264 0x7
 #define RK_H265 0x1000004
 #define RK_AV1  0x1000008
@@ -164,9 +165,9 @@ struct rk_hdr_output_metadata
 void *pkt_buf = NULL;
 size_t pkt_buf_size = 0;
 int fd;
-int fb_id;
 uint32_t plane_id, crtc_id, conn_id, hdr_metadata_blob_id, pixel_format;
 int frm_eos;
+int crtc_index;
 int crtc_width;
 int crtc_height;
 RK_U32 frm_width;
@@ -198,6 +199,22 @@ bool last_hdr_state = false;
 pthread_t tid_frame, tid_display;
 pthread_mutex_t mutex;
 pthread_cond_t cond;
+
+struct display_frame {
+  MppFrame frame;
+  int fb_id;
+  int buffer_index;
+};
+
+static struct display_frame display_pending;
+static struct display_frame display_current;
+static struct display_frame display_retired;
+static uint64_t stats_decoded;
+static uint64_t stats_replaced;
+static uint64_t stats_displayed;
+static uint64_t stats_commit_fail;
+static uint64_t stats_vblank_fail;
+static uint64_t stats_last_log_ms;
 
 drmModePlane *ovr = NULL;
 drmModeEncoder *encoder = NULL;
@@ -556,41 +573,142 @@ static int set_object_property_optional(uint32_t id, uint32_t type, const char *
   return ret;
 }
 
-void *display_thread(void *param) {
+static uint64_t monotonic_ms(void) {
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+    return 0;
+
+  return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static void release_display_frame(struct display_frame *display_frame) {
+  if (display_frame->frame)
+    mpp_frame_deinit(&display_frame->frame);
+
+  memset(display_frame, 0, sizeof(*display_frame));
+  display_frame->buffer_index = -1;
+}
+
+static void log_display_stats(bool force) {
+  uint64_t now = monotonic_ms();
+  if (!force && stats_last_log_ms && now - stats_last_log_ms < 2000)
+    return;
+
+  stats_last_log_ms = now;
+  fprintf(stderr,
+          "RK display: decoded=%llu replaced=%llu displayed=%llu commit_fail=%llu vblank_fail=%llu\n",
+          (unsigned long long)stats_decoded,
+          (unsigned long long)stats_replaced,
+          (unsigned long long)stats_displayed,
+          (unsigned long long)stats_commit_fail,
+          (unsigned long long)stats_vblank_fail);
+}
+
+static int wait_for_display_vblank(void) {
+  drmVBlank vblank = {0};
+  vblank.request.type = DRM_VBLANK_RELATIVE |
+                        ((crtc_index << DRM_VBLANK_HIGH_CRTC_SHIFT) & DRM_VBLANK_HIGH_CRTC_MASK);
+  vblank.request.sequence = 1;
+
   int ret;
-  while (!frm_eos) {
-    int _fb_id;
+  do {
+    ret = drmWaitVBlank(fd, &vblank);
+  } while (ret != 0 && errno == EINTR);
 
+  return ret;
+}
+
+static void queue_display_frame(MppFrame frame, int display_fb_id, int buffer_index) {
+  struct display_frame replaced = { .buffer_index = -1 };
+
+  pthread_mutex_lock(&mutex);
+  if (display_pending.frame) {
+    replaced = display_pending;
+    memset(&display_pending, 0, sizeof(display_pending));
+    display_pending.buffer_index = -1;
+    __sync_add_and_fetch(&stats_replaced, 1);
+  }
+  display_pending.frame = frame;
+  display_pending.fb_id = display_fb_id;
+  display_pending.buffer_index = buffer_index;
+  __sync_add_and_fetch(&stats_decoded, 1);
+  pthread_cond_signal(&cond);
+  pthread_mutex_unlock(&mutex);
+
+  release_display_frame(&replaced);
+}
+
+void *display_thread(void *param) {
+  while (1) {
+    struct display_frame submitted = { .buffer_index = -1 };
     pthread_mutex_lock(&mutex);
-    while (fb_id == 0) {
+    while (!display_pending.frame && !frm_eos)
       pthread_cond_wait(&cond, &mutex);
-      if (fb_id == 0 && frm_eos) {
-        pthread_mutex_unlock(&mutex);
-        return NULL;
-      }
-    }
-    _fb_id = fb_id;
 
-    fb_id = 0;
+    if (frm_eos) {
+      pthread_mutex_unlock(&mutex);
+      break;
+    }
+
+    submitted = display_pending;
+    memset(&display_pending, 0, sizeof(display_pending));
+    display_pending.buffer_index = -1;
     pthread_mutex_unlock(&mutex);
 
+    int ret;
     if (atomic) {
       // We may need to modeset to apply colorspace changes when toggling HDR
-      set_property(plane_id, DRM_MODE_OBJECT_PLANE, plane_props, "FB_ID", _fb_id);
+      set_property(plane_id, DRM_MODE_OBJECT_PLANE, plane_props, "FB_ID", submitted.fb_id);
       ret = drmModeAtomicCommit(fd, drm_request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
-      if (ret) {
+      if (ret)
         perror("drmModeAtomicCommit");
-      }
     } else {
-      ret = drmModeSetPlane(fd, plane_id, crtc_id, _fb_id, 0,
+      ret = drmModeSetPlane(fd, plane_id, crtc_id, submitted.fb_id, 0,
                             fb_x, fb_y, fb_width, fb_height,
                             0, 0, drm_frame_width << 16, drm_frame_height << 16);
-      if (ret) {
+      if (ret)
         perror("drmModeSetPlane");
-      }
     }
+
+    if (ret) {
+      __sync_add_and_fetch(&stats_commit_fail, 1);
+      release_display_frame(&submitted);
+      log_display_stats(false);
+      continue;
+    }
+
+    ret = wait_for_display_vblank();
+    if (ret) {
+      perror("drmWaitVBlank");
+      __sync_add_and_fetch(&stats_vblank_fail, 1);
+
+      // The commit succeeded, but scanout ownership is now unknown. Hold both
+      // frames until cleanup disables the plane.
+      release_display_frame(&display_retired);
+      display_retired = display_current;
+      memset(&display_current, 0, sizeof(display_current));
+      display_current.buffer_index = -1;
+      display_current = submitted;
+      memset(&submitted, 0, sizeof(submitted));
+      submitted.buffer_index = -1;
+      frm_eos = 1;
+      pthread_mutex_lock(&mutex);
+      pthread_cond_broadcast(&cond);
+      pthread_mutex_unlock(&mutex);
+      log_display_stats(true);
+      break;
+    }
+
+    struct display_frame previous = display_current;
+    display_current = submitted;
+    memset(&submitted, 0, sizeof(submitted));
+    submitted.buffer_index = -1;
+    __sync_add_and_fetch(&stats_displayed, 1);
+    release_display_frame(&previous);
+    log_display_stats(false);
   }
 
+  log_display_stats(true);
   return NULL;
 }
 
@@ -613,6 +731,7 @@ void *frame_thread(void *param) {
       }
     }
     if (frame) {
+      int frame_eos = mpp_frame_get_eos(frame);
       if (mpp_frame_get_info_change(frame)) {
         // new resolution
         assert(!mpi_frm_grp);
@@ -875,19 +994,21 @@ void *frame_thread(void *param) {
             }
             display_fb_id = rga_to_drm[i].fb_id;
           }
-          // send DRM FB to display thread
-          pthread_mutex_lock(&mutex);
-          fb_id = display_fb_id;
-          pthread_cond_signal(&cond);
-          pthread_mutex_unlock(&mutex);
+          // Transfer MppFrame ownership to the display mailbox. The display
+          // thread releases it only after scanout has moved to a newer FB.
+          queue_display_frame(frame, display_fb_id, i);
+          frame = NULL;
         } else {
           fprintf(stderr, "Frame no buff\n");
         }
       }
 
-      frm_eos = mpp_frame_get_eos(frame);
-      mpp_frame_deinit(&frame);
-      frame = NULL;
+      if (frame_eos)
+        frm_eos = 1;
+      if (frame) {
+        mpp_frame_deinit(&frame);
+        frame = NULL;
+      }
     } else {
       if (!frm_eos) {
         fprintf(stderr, "Didn't get frame from MPP (return code = %d)\n", ret);
@@ -916,9 +1037,9 @@ int rk_setup(int videoFormat, int width, int height, int redrawRate, void* conte
   if (drm_card == NULL || drm_card[0] == 0)
     drm_card = "/dev/dri/card0";
 
-  fb_id = 0;
   fd = -1;
   frm_eos = 0;
+  crtc_index = 0;
   mpi_frm_grp = NULL;
   hdr_metadata_blob_id = 0;
   plane_id = 0;
@@ -930,6 +1051,18 @@ int rk_setup(int videoFormat, int width, int height, int redrawRate, void* conte
   rga_output_ver_stride = 0;
   frame_thread_started = false;
   display_thread_started = false;
+  memset(&display_pending, 0, sizeof(display_pending));
+  memset(&display_current, 0, sizeof(display_current));
+  memset(&display_retired, 0, sizeof(display_retired));
+  display_pending.buffer_index = -1;
+  display_current.buffer_index = -1;
+  display_retired.buffer_index = -1;
+  stats_decoded = 0;
+  stats_replaced = 0;
+  stats_displayed = 0;
+  stats_commit_fail = 0;
+  stats_vblank_fail = 0;
+  stats_last_log_ms = 0;
   memset(frame_to_drm, 0, sizeof(frame_to_drm));
   memset(rga_to_drm, 0, sizeof(rga_to_drm));
   rgbframe_mode = env_enabled("MOONLIGHT_RK_RGBFRAME", false);
@@ -1035,6 +1168,7 @@ int rk_setup(int videoFormat, int width, int height, int redrawRate, void* conte
     }
   }
   assert(i < resources->count_crtcs);
+  crtc_index = i;
   crtc_id = crtc->crtc_id;
   crtc_width = crtc->width;
   crtc_height = crtc->height;
@@ -1251,27 +1385,59 @@ int rk_setup(int videoFormat, int width, int height, int redrawRate, void* conte
   return 0;
 }
 
+static void disable_video_plane(void) {
+  if (rgbframe_mode || fd < 0 || !plane_id)
+    return;
+
+  int ret;
+  if (atomic) {
+    ret = set_property(plane_id, DRM_MODE_OBJECT_PLANE, plane_props, "FB_ID", 0);
+    if (!ret)
+      ret = drmModeAtomicCommit(fd, drm_request, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
+  } else {
+    ret = drmModeSetPlane(fd, plane_id, crtc_id, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  }
+
+  if (ret) {
+    perror("RK DRM: disable plane");
+    return;
+  }
+
+  if (wait_for_display_vblank() != 0)
+    perror("RK DRM: wait after plane disable");
+}
+
 void rk_cleanup() {
 
   int i;
   int ret;
 
   frm_eos = 1;
+  if (mpi_ctx && mpi_api) {
+    ret = mpi_api->reset(mpi_ctx);
+    assert(!ret);
+  }
+
+  if (frame_thread_started) {
+    pthread_join(tid_frame, NULL);
+    frame_thread_started = false;
+  }
+
   pthread_mutex_lock(&mutex);
-  pthread_cond_signal(&cond);
+  pthread_cond_broadcast(&cond);
   pthread_mutex_unlock(&mutex);
 
-  if (display_thread_started)
+  if (display_thread_started) {
     pthread_join(tid_display, NULL);
+    display_thread_started = false;
+  }
 
+  disable_video_plane();
+  release_display_frame(&display_pending);
+  release_display_frame(&display_current);
+  release_display_frame(&display_retired);
   pthread_cond_destroy(&cond);
   pthread_mutex_destroy(&mutex);
-
-  ret = mpi_api->reset(mpi_ctx);
-  assert(!ret);
-
-  if (frame_thread_started)
-    pthread_join(tid_frame, NULL);
 
   if (mpi_frm_grp) {
     ret = mpp_buffer_group_put(mpi_frm_grp);

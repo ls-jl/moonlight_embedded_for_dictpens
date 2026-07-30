@@ -20,6 +20,7 @@
 #include "evdev.h"
 
 #include "keyboard.h"
+#include "touch_utils.h"
 
 #include "../loop.h"
 
@@ -66,7 +67,7 @@ struct input_abs_parms {
   int range, diff;
 };
 
-#define TOUCHPAD_MAX_SLOTS 10
+#define TOUCHPAD_MAX_SLOTS ML_TOUCH_MAX_SLOTS
 
 struct touchpad_slot {
   bool active;
@@ -96,25 +97,19 @@ struct input_device {
   char modifiers;
   #ifdef __linux__
   __s32 mouseDeltaX, mouseDeltaY, mouseVScroll, mouseHScroll;
-  __s32 touchDownX, touchDownY, touchX, touchY;
-  __s32 touchMinX, touchMaxX, touchMinY, touchMaxY;
   #else
   int32_t mouseDeltaX, mouseDeltaY, mouseVScroll, mouseHScroll;
-  int32_t touchDownX, touchDownY, touchX, touchY;
-  int32_t touchMinX, touchMaxX, touchMinY, touchMaxY;
   #endif
-  struct timeval touchDownTime;
+  int32_t touchMinX, touchMaxX, touchMinY, touchMaxY;
   struct timeval btnDownTime;
   int touchSlot;
-  int touchTrackingId;
-  bool touchActive;
-  bool touchSentDown;
-  bool touchPositionValid;
-  bool touchPositionDirty;
-  bool touchUpPending;
   bool touchDirectUnsupported;
   bool touchpadMode;
   bool touchHasMtSlots;
+  int touchOffsetX, touchOffsetY;
+  struct ml_touch_slot touchSlots[ML_TOUCH_MAX_SLOTS];
+  int touchMouseSlot;
+  bool touchMouseDown;
   struct touchpad_slot touchpadSlots[TOUCHPAD_MAX_SLOTS];
   int touchpadGestureMaxFingers;
   bool touchpadGestureMoved;
@@ -146,10 +141,8 @@ static const int hat_constants[3][3] = {{HAT_UP | HAT_LEFT, HAT_UP, HAT_UP | HAT
 
 #define set_hat(flags, flag, hat, hat_flag) flags = (hat & hat_flag) == hat_flag ? flags | flag : flags & ~flag
 
-#define TOUCH_UP -1
 #define TOUCH_CLICK_RADIUS 10
 #define TOUCH_CLICK_DELAY 100000 // microseconds
-#define TOUCH_RCLICK_TIME 750 // milliseconds
 #define TOUCH_MOUSE_REFERENCE 10000
 #define TOUCHPAD_MOTION_MULTIPLIER 1
 #define TOUCHPAD_DRAG_TAP_WINDOW_MS 350
@@ -180,10 +173,84 @@ static bool* currentReverse;
 
 static bool grabbingDevices;
 static bool mouseEmulationEnabled;
+static bool configuredTouchDevice;
+static bool configuredTouchDeviceValid;
+static dev_t configuredTouchRdev;
+static char configuredTouchPath[PATH_MAX];
+static int configuredTouchRotation = -1;
+static int configuredTouchOffsetX;
+static int configuredTouchOffsetY;
 
 static bool waitingToExitOnModifiersUp = false;
 
 int evdev_gamepads = 0;
+
+static int env_int(const char *name, int fallback) {
+  const char *value = getenv(name);
+  if (!value || !value[0])
+    return fallback;
+
+  char *end = NULL;
+  long parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < INT_MIN || parsed > INT_MAX)
+    return fallback;
+
+  return (int)parsed;
+}
+
+static int normalize_rotation(int rotation, int fallback) {
+  switch (rotation) {
+  case 0:
+  case 90:
+  case 180:
+  case 270:
+    return rotation;
+  default:
+    return fallback;
+  }
+}
+
+void evdev_configure_touch_from_env(void) {
+  const char *path = getenv("MOONLIGHT_RK_TOUCH_DEVICE");
+  configuredTouchDevice = path && path[0];
+  configuredTouchDeviceValid = false;
+  configuredTouchRdev = 0;
+  configuredTouchPath[0] = '\0';
+  configuredTouchRotation = normalize_rotation(env_int("MOONLIGHT_RK_TOUCH_ROTATION", -1), -1);
+  configuredTouchOffsetX = env_int("MOONLIGHT_RK_TOUCH_OFFSET_X", 0);
+  configuredTouchOffsetY = env_int("MOONLIGHT_RK_TOUCH_OFFSET_Y", 0);
+
+  if (!configuredTouchDevice)
+    return;
+
+  snprintf(configuredTouchPath, sizeof(configuredTouchPath), "%s", path);
+  struct stat st;
+  if (stat(path, &st) == 0) {
+    configuredTouchRdev = st.st_rdev;
+    configuredTouchDeviceValid = true;
+    fprintf(stderr, "Touch config: device=%s rdev=%llu rotation=%d offset=%d,%d\n",
+            configuredTouchPath,
+            (unsigned long long)configuredTouchRdev,
+            configuredTouchRotation,
+            configuredTouchOffsetX,
+            configuredTouchOffsetY);
+  } else {
+    fprintf(stderr, "Touch config: unable to stat %s: %s; touchscreen input disabled\n",
+            configuredTouchPath, strerror(errno));
+  }
+}
+
+static bool configured_touch_matches(dev_t rdev) {
+  if (!configuredTouchDevice)
+    return false;
+
+  struct stat st;
+  if (stat(configuredTouchPath, &st) == 0) {
+    configuredTouchRdev = st.st_rdev;
+    configuredTouchDeviceValid = true;
+  }
+  return configuredTouchDeviceValid && configuredTouchRdev == rdev;
+}
 
 #define ACTION_MODIFIERS (MODIFIER_SHIFT|MODIFIER_ALT|MODIFIER_CTRL)
 #define QUIT_KEY KEY_Q
@@ -351,50 +418,34 @@ static void evdev_touch_bounds(struct input_device* dev, int code, int* min, int
   }
 }
 
-static float normalize_axis(int value, int min, int max) {
-  if (max <= min)
-    return 0.0f;
-  float normalized = (float)(value - min) / (float)(max - min);
-  if (normalized < 0.0f)
-    return 0.0f;
-  if (normalized > 1.0f)
-    return 1.0f;
-  return normalized;
+static void evdev_transform_touch(struct input_device* dev, struct ml_touch_slot* slot,
+                                  float* outX, float* outY) {
+  ml_touch_transform(slot->x, slot->y,
+                     dev->touchMinX, dev->touchMaxX,
+                     dev->touchMinY, dev->touchMaxY,
+                     dev->touchOffsetX, dev->touchOffsetY,
+                     dev->rotate, outX, outY);
 }
 
-static void evdev_transform_touch(struct input_device* dev, float* outX, float* outY) {
-  float x = normalize_axis(dev->touchX, dev->touchMinX, dev->touchMaxX);
-  float y = normalize_axis(dev->touchY, dev->touchMinY, dev->touchMaxY);
+static void evdev_send_touch_mouse_fallback(struct input_device* dev, int slotIndex,
+                                            unsigned char eventType, float x, float y) {
+  if (dev->touchMouseSlot < 0 && eventType != LI_TOUCH_EVENT_UP)
+    dev->touchMouseSlot = slotIndex;
+  if (dev->touchMouseSlot != slotIndex)
+    return;
 
-  switch (dev->rotate) {
-  case 90:
-    *outX = y;
-    *outY = 1.0f - x;
-    break;
-  case 180:
-    *outX = 1.0f - x;
-    *outY = 1.0f - y;
-    break;
-  case 270:
-    *outX = 1.0f - y;
-    *outY = x;
-    break;
-  default:
-    *outX = x;
-    *outY = y;
-    break;
-  }
-}
-
-static void evdev_send_touch_mouse_fallback(struct input_device* dev, unsigned char eventType, float x, float y) {
   short mouseX = (short)(x * TOUCH_MOUSE_REFERENCE);
   short mouseY = (short)(y * TOUCH_MOUSE_REFERENCE);
   LiSendMousePositionEvent(mouseX, mouseY, TOUCH_MOUSE_REFERENCE, TOUCH_MOUSE_REFERENCE);
 
-  if (eventType == LI_TOUCH_EVENT_DOWN)
+  if (eventType != LI_TOUCH_EVENT_UP && !dev->touchMouseDown) {
     LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, BUTTON_LEFT);
-  else if (eventType == LI_TOUCH_EVENT_UP)
+    dev->touchMouseDown = true;
+  } else if (eventType == LI_TOUCH_EVENT_UP && dev->touchMouseDown) {
     LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+    dev->touchMouseDown = false;
+    dev->touchMouseSlot = -1;
+  }
 }
 
 static int timeval_diff_ms(struct timeval* newer, struct timeval* older) {
@@ -491,10 +542,12 @@ static void touchpad_update_slot_axis(struct input_device* dev, int slotIndex, b
 
   bool wasValid = slot->positionValid;
   if (isX) {
-    slot->x = value;
+    slot->x = ml_touchpad_normalize_axis(value, dev->touchMinX, dev->touchMaxX,
+                                         dev->touchOffsetX);
     slot->xValid = true;
   } else {
-    slot->y = value;
+    slot->y = ml_touchpad_normalize_axis(value, dev->touchMinY, dev->touchMaxY,
+                                         dev->touchOffsetY);
     slot->yValid = true;
   }
 
@@ -653,99 +706,114 @@ static void touchpad_release_all(struct input_device* dev, struct timeval eventT
     touchpad_finish_gesture(dev, eventTime);
 }
 
-static void evdev_reset_touch_state(struct input_device* dev) {
-  dev->touchActive = false;
-  dev->touchSentDown = false;
-  dev->touchPositionValid = false;
-  dev->touchPositionDirty = false;
-  dev->touchUpPending = false;
-  dev->touchTrackingId = -1;
-  dev->touchDownX = TOUCH_UP;
-  dev->touchDownY = TOUCH_UP;
+static void evdev_begin_direct_slot(struct input_device* dev, int slotIndex, int trackingId) {
+  if (slotIndex < 0 || slotIndex >= ML_TOUCH_MAX_SLOTS)
+    return;
+  ml_touch_slot_begin(&dev->touchSlots[slotIndex], trackingId);
 }
 
-static void evdev_send_touchpad_click_if_needed(struct input_device* dev, long eventSec, long eventUsec) {
-  if (dev->touchDownX == TOUCH_UP || dev->touchDownY == TOUCH_UP)
+static void evdev_release_direct_slot(struct input_device* dev, int slotIndex) {
+  if (slotIndex < 0 || slotIndex >= ML_TOUCH_MAX_SLOTS)
     return;
-
-  int deltaX = dev->touchX - dev->touchDownX;
-  int deltaY = dev->touchY - dev->touchDownY;
-  if (deltaX * deltaX + deltaY * deltaY >= TOUCH_CLICK_RADIUS * TOUCH_CLICK_RADIUS)
-    return;
-
-  struct timeval eventTime;
-  eventTime.tv_sec = eventSec;
-  eventTime.tv_usec = eventUsec;
-  struct timeval elapsedTime;
-  timersub(&eventTime, &dev->touchDownTime, &elapsedTime);
-  int holdTimeMs = elapsedTime.tv_sec * 1000 + elapsedTime.tv_usec / 1000;
-  int button = holdTimeMs >= TOUCH_RCLICK_TIME ? BUTTON_RIGHT : BUTTON_LEFT;
-  LiSendMouseButtonEvent(BUTTON_ACTION_PRESS, button);
-  usleep(TOUCH_CLICK_DELAY);
-  LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, button);
+  ml_touch_slot_end(&dev->touchSlots[slotIndex]);
 }
 
-static void evdev_handle_touch_release(struct input_device* dev, long eventSec, long eventUsec) {
-  if (dev->touchpadMode) {
-    evdev_send_touchpad_click_if_needed(dev, eventSec, eventUsec);
-    evdev_reset_touch_state(dev);
+static void evdev_release_all_direct_slots(struct input_device* dev) {
+  for (int i = 0; i < ML_TOUCH_MAX_SLOTS; i++)
+    evdev_release_direct_slot(dev, i);
+}
+
+static void evdev_start_mouse_fallback_if_needed(struct input_device* dev) {
+  if (!dev->touchDirectUnsupported || dev->touchMouseSlot >= 0)
     return;
+
+  for (int i = 0; i < ML_TOUCH_MAX_SLOTS; i++) {
+    struct ml_touch_slot* slot = &dev->touchSlots[i];
+    if (!slot->active || !slot->x_valid || !slot->y_valid)
+      continue;
+
+    float x;
+    float y;
+    evdev_transform_touch(dev, slot, &x, &y);
+    evdev_send_touch_mouse_fallback(dev, i, LI_TOUCH_EVENT_DOWN, x, y);
+    break;
   }
-
-  if (dev->touchDownX != TOUCH_UP && dev->touchDownY != TOUCH_UP && dev->touchDirectUnsupported)
-    evdev_send_touchpad_click_if_needed(dev, eventSec, eventUsec);
-
-  dev->touchUpPending = true;
-  dev->touchDownX = TOUCH_UP;
-  dev->touchDownY = TOUCH_UP;
 }
 
 static void evdev_flush_touch(struct input_device* dev) {
-  if (!dev->touchPositionValid)
+  for (int i = 0; i < ML_TOUCH_MAX_SLOTS; i++) {
+    struct ml_touch_slot* slot = &dev->touchSlots[i];
+    if (!slot->x_valid || !slot->y_valid) {
+      if (slot->up_pending)
+        ml_touch_slot_reset(slot);
+      continue;
+    }
+
+    unsigned char eventType = 0;
+    if (slot->up_pending)
+      eventType = LI_TOUCH_EVENT_UP;
+    else if (slot->active && !slot->sent_down)
+      eventType = LI_TOUCH_EVENT_DOWN;
+    else if (slot->active && slot->dirty)
+      eventType = LI_TOUCH_EVENT_MOVE;
+    else
+      continue;
+
+    float x;
+    float y;
+    evdev_transform_touch(dev, slot, &x, &y);
+
+    if (!dev->touchDirectUnsupported) {
+      int ret = LiSendTouchEvent(eventType,
+                                 slot->tracking_id >= 0 ? (uint32_t)slot->tracking_id : (uint32_t)i,
+                                 x,
+                                 y,
+                                 eventType == LI_TOUCH_EVENT_UP ? 0.0f : 1.0f,
+                                 0.0f,
+                                 0.0f,
+                                 LI_ROT_UNKNOWN);
+      if (ret == LI_ERR_UNSUPPORTED) {
+        dev->touchDirectUnsupported = true;
+        evdev_send_touch_mouse_fallback(dev, i, eventType, x, y);
+      }
+    } else {
+      evdev_send_touch_mouse_fallback(dev, i, eventType, x, y);
+    }
+
+    if (eventType == LI_TOUCH_EVENT_DOWN)
+      slot->sent_down = true;
+    if (eventType == LI_TOUCH_EVENT_UP)
+      ml_touch_slot_reset(slot);
+    else
+      slot->dirty = false;
+  }
+
+  evdev_start_mouse_fallback_if_needed(dev);
+}
+
+static void evdev_cancel_touch_input(struct input_device* dev) {
+  if (!dev->is_touchscreen)
     return;
 
-  unsigned char eventType = 0;
-  if (dev->touchUpPending)
-    eventType = LI_TOUCH_EVENT_UP;
-  else if (dev->touchActive && !dev->touchSentDown)
-    eventType = LI_TOUCH_EVENT_DOWN;
-  else if (dev->touchActive && dev->touchPositionDirty)
-    eventType = LI_TOUCH_EVENT_MOVE;
-  else
+  if (dev->touchpadMode) {
+    touchpad_release_left_if_needed(dev);
+    for (int i = 0; i < TOUCHPAD_MAX_SLOTS; i++)
+      memset(&dev->touchpadSlots[i], 0, sizeof(dev->touchpadSlots[i]));
+    dev->touchpadLastTapValid = false;
+    touchpad_reset_gesture(dev);
     return;
-
-  float x;
-  float y;
-  evdev_transform_touch(dev, &x, &y);
+  }
 
   if (!dev->touchDirectUnsupported) {
-    int ret = LiSendTouchEvent(eventType,
-                               dev->touchTrackingId >= 0 ? (uint32_t)dev->touchTrackingId : 0,
-                               x,
-                               y,
-                               eventType == LI_TOUCH_EVENT_UP ? 0.0f : 1.0f,
-                               0.0f,
-                               0.0f,
-                               LI_ROT_UNKNOWN);
-    if (ret == LI_ERR_UNSUPPORTED) {
-      dev->touchDirectUnsupported = true;
-      evdev_send_touch_mouse_fallback(dev, eventType, x, y);
-    }
-  } else {
-    evdev_send_touch_mouse_fallback(dev, eventType, x, y);
+    LiSendTouchEvent(LI_TOUCH_EVENT_CANCEL_ALL, 0, 0.0f, 0.0f, 0.0f,
+                     0.0f, 0.0f, LI_ROT_UNKNOWN);
   }
-
-  if (eventType == LI_TOUCH_EVENT_DOWN)
-    dev->touchSentDown = true;
-  if (eventType == LI_TOUCH_EVENT_UP) {
-    dev->touchActive = false;
-    dev->touchSentDown = false;
-    dev->touchUpPending = false;
-    dev->touchTrackingId = -1;
-    dev->touchDownX = TOUCH_UP;
-    dev->touchDownY = TOUCH_UP;
-  }
-  dev->touchPositionDirty = false;
+  if (dev->touchMouseDown)
+    LiSendMouseButtonEvent(BUTTON_ACTION_RELEASE, BUTTON_LEFT);
+  dev->touchMouseDown = false;
+  dev->touchMouseSlot = -1;
+  for (int i = 0; i < ML_TOUCH_MAX_SLOTS; i++)
+    ml_touch_slot_reset(&dev->touchSlots[i]);
 }
 
 static int evdev_get_map(int* map, int length, int value) {
@@ -786,6 +854,7 @@ static void evdev_remove(int devindex) {
     devices[devindex].mouseEmulation = false;
     pthread_join(devices[devindex].meThread, NULL);
   }
+  evdev_cancel_touch_input(&devices[devindex]);
 
   libevdev_free(devices[devindex].dev);
   loop_remove_fd(devices[devindex].fd);
@@ -952,6 +1021,8 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
 
   switch (ev->type) {
   case EV_SYN:
+    if (ev->code != SYN_REPORT)
+      break;
     if (dev->is_touchscreen) {
       if (dev->touchpadMode)
         touchpad_flush(dev);
@@ -1084,16 +1155,13 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
           } else if (ev->value == 0) {
             touchpad_release_all(dev, eventTime);
           }
-        } else if (ev->value == 1) {
-          dev->touchDownTime.tv_sec = ev->input_event_sec;
-          dev->touchDownTime.tv_usec = ev->input_event_usec;
-          dev->touchActive = true;
-          dev->touchUpPending = false;
-          dev->touchPositionDirty = false;
-          if (dev->touchTrackingId < 0)
-            dev->touchTrackingId = 0;
-        } else {
-          evdev_handle_touch_release(dev, ev->input_event_sec, ev->input_event_usec);
+        } else if (!dev->touchHasMtSlots) {
+          if (ev->value == 1)
+            evdev_begin_direct_slot(dev, 0, 0);
+          else
+            evdev_release_direct_slot(dev, 0);
+        } else if (ev->value == 0) {
+          evdev_release_all_direct_slots(dev);
         }
         break;
       default:
@@ -1242,16 +1310,11 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
             touchpad_begin_slot(dev, dev->touchSlot, ev->value, eventTime);
           else
             touchpad_release_slot(dev, dev->touchSlot, eventTime);
-        } else if (dev->touchSlot == 0) {
-          if (ev->value >= 0) {
-            dev->touchTrackingId = ev->value;
-            dev->touchActive = true;
-            dev->touchSentDown = false;
-            dev->touchUpPending = false;
-            dev->touchPositionDirty = false;
-          } else {
-            evdev_handle_touch_release(dev, ev->input_event_sec, ev->input_event_usec);
-          }
+        } else {
+          if (ev->value >= 0)
+            evdev_begin_direct_slot(dev, dev->touchSlot, ev->value);
+          else
+            evdev_release_direct_slot(dev, dev->touchSlot);
         }
         break;
       case ABS_MT_POSITION_X:
@@ -1261,18 +1324,11 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
           touchpad_update_slot_axis(dev, slot, true, ev->value);
           break;
         }
-        if (dev->touchSlot != 0)
-          break;
-        if (dev->touchDownX == TOUCH_UP) {
-          dev->touchDownX = ev->value;
-          dev->touchX = ev->value;
-        } else {
-          if (dev->touchpadMode && dev->touchActive && dev->touchPositionValid)
-            dev->mouseDeltaX += (ev->value - dev->touchX) * TOUCHPAD_MOTION_MULTIPLIER;
-          dev->touchX = ev->value;
+        {
+          int slot = ev->code == ABS_X ? 0 : dev->touchSlot;
+          if (slot >= 0 && slot < ML_TOUCH_MAX_SLOTS)
+            ml_touch_slot_update(&dev->touchSlots[slot], true, ev->value);
         }
-        dev->touchPositionValid = dev->touchDownY != TOUCH_UP;
-        dev->touchPositionDirty = true;
         break;
       case ABS_MT_POSITION_Y:
       case ABS_Y:
@@ -1281,18 +1337,11 @@ static bool evdev_handle_event(struct input_event *ev, struct input_device *dev)
           touchpad_update_slot_axis(dev, slot, false, ev->value);
           break;
         }
-        if (dev->touchSlot != 0)
-          break;
-        if (dev->touchDownY == TOUCH_UP) {
-          dev->touchDownY = ev->value;
-          dev->touchY = ev->value;
-        } else {
-          if (dev->touchpadMode && dev->touchActive && dev->touchPositionValid)
-            dev->mouseDeltaY += (ev->value - dev->touchY) * TOUCHPAD_MOTION_MULTIPLIER;
-          dev->touchY = ev->value;
+        {
+          int slot = ev->code == ABS_Y ? 0 : dev->touchSlot;
+          if (slot >= 0 && slot < ML_TOUCH_MAX_SLOTS)
+            ml_touch_slot_update(&dev->touchSlots[slot], false, ev->value);
         }
-        dev->touchPositionValid = dev->touchDownX != TOUCH_UP;
-        dev->touchPositionDirty = true;
         break;
       }
       break;
@@ -1546,8 +1595,9 @@ void evdev_create(const char* device, struct mapping* mappings, bool verbose, in
 
   bool is_keyboard = evdev_has_keyboard_keys(evdev);
   bool is_mouse = libevdev_has_event_type(evdev, EV_REL) || libevdev_has_event_code(evdev, EV_KEY, BTN_LEFT);
-  bool is_touchscreen =
-    libevdev_has_event_code(evdev, EV_KEY, BTN_TOUCH) &&
+  bool has_touch_capability =
+    (libevdev_has_event_code(evdev, EV_KEY, BTN_TOUCH) ||
+     libevdev_has_event_code(evdev, EV_ABS, ABS_MT_TRACKING_ID)) &&
     ((libevdev_has_event_code(evdev, EV_ABS, ABS_X) &&
       libevdev_has_event_code(evdev, EV_ABS, ABS_Y)) ||
      (libevdev_has_event_code(evdev, EV_ABS, ABS_MT_POSITION_X) &&
@@ -1589,6 +1639,15 @@ void evdev_create(const char* device, struct mapping* mappings, bool verbose, in
     libevdev_has_event_code(evdev, EV_KEY, BTN_START) ||
     libevdev_has_event_code(evdev, EV_KEY, BTN_MODE);
   bool is_gamepad = has_gamepad_button && (has_gamepad_axis || !is_keyboard);
+  bool touch_device_matches = configured_touch_matches(st.st_rdev);
+  bool is_touchscreen = ml_touch_device_allowed(has_touch_capability, is_gamepad,
+                                                configuredTouchDevice, touch_device_matches);
+
+  if (has_touch_capability && !is_touchscreen && verbose) {
+    fprintf(stderr, "Ignoring touch capability on %s (%s): %s\n",
+            name, device,
+            configuredTouchDevice ? "not configured physical touchscreen" : "gamepad touch surface");
+  }
 
   if (is_accelerometer) {
     if (verbose)
@@ -1644,11 +1703,13 @@ void evdev_create(const char* device, struct mapping* mappings, bool verbose, in
   devices[dev].is_keyboard = is_keyboard;
   devices[dev].is_mouse = is_mouse;
   devices[dev].is_touchscreen = is_touchscreen;
-  devices[dev].rotate = rotate;
-  devices[dev].touchDownX = TOUCH_UP;
-  devices[dev].touchDownY = TOUCH_UP;
+  devices[dev].rotate = configuredTouchRotation >= 0 ? configuredTouchRotation : rotate;
   devices[dev].touchSlot = 0;
-  devices[dev].touchTrackingId = -1;
+  devices[dev].touchMouseSlot = -1;
+  devices[dev].touchOffsetX = configuredTouchOffsetX;
+  devices[dev].touchOffsetY = configuredTouchOffsetY;
+  for (int i = 0; i < ML_TOUCH_MAX_SLOTS; i++)
+    ml_touch_slot_reset(&devices[dev].touchSlots[i]);
   for (int i = 0; i < TOUCHPAD_MAX_SLOTS; i++)
     devices[dev].touchpadSlots[i].trackingId = -1;
   devices[dev].touchMinX = 0;
@@ -1691,14 +1752,31 @@ void evdev_create(const char* device, struct mapping* mappings, bool verbose, in
     evdev_touch_bounds(&devices[dev], ABS_Y, &devices[dev].touchMinY, &devices[dev].touchMaxY);
     evdev_touch_bounds(&devices[dev], ABS_MT_POSITION_X, &devices[dev].touchMinX, &devices[dev].touchMaxX);
     evdev_touch_bounds(&devices[dev], ABS_MT_POSITION_Y, &devices[dev].touchMinY, &devices[dev].touchMaxY);
-    fprintf(stderr, "Touch input %s on %s bounds %d..%d x %d..%d rotate %d mode %s\n",
+    int activeMinX = devices[dev].touchMinX + devices[dev].touchOffsetX;
+    int activeMinY = devices[dev].touchMinY + devices[dev].touchOffsetY;
+    if (activeMinX < devices[dev].touchMinX)
+      activeMinX = devices[dev].touchMinX;
+    if (activeMinX > devices[dev].touchMaxX)
+      activeMinX = devices[dev].touchMaxX;
+    if (activeMinY < devices[dev].touchMinY)
+      activeMinY = devices[dev].touchMinY;
+    if (activeMinY > devices[dev].touchMaxY)
+      activeMinY = devices[dev].touchMaxY;
+    fprintf(stderr,
+            "Touch input %s on %s rdev=%llu raw=%d..%d x %d..%d active=%d..%d x %d..%d slots=%d rotate=%d mode=%s\n",
             name,
             device,
+            (unsigned long long)devices[dev].rdev,
             devices[dev].touchMinX,
             devices[dev].touchMaxX,
             devices[dev].touchMinY,
             devices[dev].touchMaxY,
-            rotate,
+            activeMinX,
+            devices[dev].touchMaxX,
+            activeMinY,
+            devices[dev].touchMaxY,
+            devices[dev].touchHasMtSlots ? ML_TOUCH_MAX_SLOTS : 1,
+            devices[dev].rotate,
             devices[dev].touchpadMode ? "touchpad" : "screen");
   } else if (is_gamepad) {
     fprintf(stderr, "Gamepad input %s on %s ready\n", name, device);
@@ -1861,6 +1939,8 @@ void evdev_start() {
 
 void evdev_stop() {
   evdev_drain();
+  for (int i = 0; i < numDevices; i++)
+    evdev_cancel_touch_input(&devices[i]);
 }
 
 void evdev_init(bool mouse_emulation_enabled) {

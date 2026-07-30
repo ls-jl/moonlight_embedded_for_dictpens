@@ -6,11 +6,13 @@ include(${CMAKE_ROOT}/Modules/GNUInstallDirs.cmake)
 include(${CMAKE_SOURCE_DIR}/cmake/generate_version_header.cmake)
 
 include(CheckCSourceCompiles)
+option(BUILD_TESTING "Build Moonlight helper tests" OFF)
+include(CTest)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter -Wno-pointer-sign -Wno-sign-compare -Wno-switch)
 
 aux_source_directory(./src SRC_LIST)
-list(APPEND SRC_LIST ./src/input/evdev.c ./src/input/mapping.c ./src/input/udev.c)
+list(APPEND SRC_LIST ./src/input/evdev.c ./src/input/mapping.c ./src/input/touch_utils.c ./src/input/udev.c)
 
 set(MOONLIGHT_DEFINITIONS)
 
@@ -243,3 +245,12 @@ if (INSTALL_GAMECONTROLLERDB)
   endif()
 endif()
 install(FILES moonlight.conf DESTINATION ${CMAKE_INSTALL_SYSCONFDIR})
+
+if(BUILD_TESTING)
+  add_executable(test-touch-utils
+    ./tests/test_touch_utils.c
+    ./src/input/touch_utils.c)
+  target_include_directories(test-touch-utils PRIVATE ./src/input)
+  target_link_libraries(test-touch-utils m)
+  add_test(NAME touch-utils COMMAND test-touch-utils)
+endif()

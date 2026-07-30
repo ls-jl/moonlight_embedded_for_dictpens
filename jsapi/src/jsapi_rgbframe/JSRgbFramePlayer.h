@@ -30,6 +30,7 @@ public:
     void isMoonlightRunning(JQUTIL_NS::JQFunctionInfo &info);
     void pairMoonlight(JQUTIL_NS::JQFunctionInfo &info);
     void getDrmScreenSize(JQUTIL_NS::JQFunctionInfo &info);
+    void getSystemDisplayConfig(JQUTIL_NS::JQFunctionInfo &info);
 
 protected:
     void OnGCCollect() override;

@@ -49,6 +49,7 @@ RK 视频后端位于 `moonlight-embedded-master/src/video/rk.c`。
 
 - MPP 硬解码。
 - DRM plane 显示。
+- MPP 帧通过 latest-wins 邮箱交给显示线程，并在 DRM vblank 后释放，避免扫描期间复用解码 buffer。
 - 优先使用 DRM plane rotation。
 - DRM plane 不支持旋转时，使用 RGA 硬件旋转 `90`、`180`、`270` 度。
 - 不做 CPU 旋转 fallback。
@@ -57,7 +58,10 @@ RK 视频后端位于 `moonlight-embedded-master/src/video/rk.c`。
 输入相关修改主要在 `moonlight-embedded-master/src/input/evdev.c`：
 
 - 触摸屏模式。
+- 屏幕模式支持多点 MT slot，并在退出或设备移除时取消全部触点。
 - 触摸板模式，模拟相对鼠标移动。
+- 触摸板坐标按有效 ABS 区域归一化为 `0..4095`，保持不同触控分辨率下的手势比例一致。
+- 从 `/etc/miniapp/resources/cfg.json` 读取物理触摸节点、视频/触摸方向和触摸偏移，避免把手柄触摸面识别为屏幕。
 - 手柄热插拔 rescan。
 - DualShock 4 fallback 映射。
 - Sony 手柄上报为 Xbox controller，提升主机兼容性。
@@ -71,6 +75,7 @@ miniapp 原生桥接位于 `jsapi/src/jsapi_rgbframe/JSRgbFramePlayer.cpp`：
 - 输入模式下切换 RK USB OTG 到 host 模式。
 - 串流期间持续重设 Wi-Fi 和 USB runtime power。
 - 将 miniapp JS 侧串流参数转换为 Moonlight CLI 参数。
+- 读取系统面板尺寸和 `fps_max`，系统配置缺失时依次回退到 Falcon 设备尺寸和 DRM mode。
 
 ## 目录结构
 

@@ -277,18 +277,54 @@ function evenDimension(value) {
   return Math.max(2, parsed - (parsed % 2))
 }
 
-function readDeviceSize() {
-  let width = DEFAULT_SCREEN_WIDTH
-  let height = DEFAULT_SCREEN_HEIGHT
+function normalizeRotation(value, fallback) {
+  const parsed = Number(value)
+  return parsed === 0 || parsed === 90 || parsed === 180 || parsed === 270 ? parsed : fallback
+}
+
+function readSystemDisplayConfig() {
+  try {
+    if (!rgbFramePlayer || typeof rgbFramePlayer.getSystemDisplayConfig !== 'function') {
+      return null
+    }
+    const value = rgbFramePlayer.getSystemDisplayConfig()
+    const config = typeof value === 'string' ? JSON.parse(value) : value
+    return config && typeof config === 'object' ? config : null
+  } catch (err) {
+    console.warn(`read system display config failed ${err}`)
+    return null
+  }
+}
+
+function readDeviceSize(systemConfig) {
+  if (systemConfig) {
+    const panel = parseSizeText(systemConfig.panelSize)
+    if (panel) {
+      return panel
+    }
+    const width = positiveInt(systemConfig.width, 0)
+    const height = positiveInt(systemConfig.height, 0)
+    if (width > 0 && height > 0) {
+      return { width, height }
+    }
+  }
+
+  let width = 0
+  let height = 0
   try {
     if (typeof $falcon !== 'undefined' && $falcon && $falcon.env) {
-      width = positiveInt($falcon.env.deviceWidth, width)
-      height = positiveInt($falcon.env.deviceHeight, height)
+      width = positiveInt($falcon.env.deviceWidth, 0)
+      height = positiveInt($falcon.env.deviceHeight, 0)
     }
   } catch (err) {
     console.warn(`read device size failed ${err}`)
   }
-  return { width, height }
+  if (width > 0 && height > 0) {
+    return { width, height }
+  }
+
+  const drm = readRawDrmSize()
+  return drm || { width: DEFAULT_SCREEN_WIDTH, height: DEFAULT_SCREEN_HEIGHT }
 }
 
 function readRawDrmSize() {
@@ -313,6 +349,16 @@ function moonlightGeometry(logicalWidth, logicalHeight, rotate) {
     }
   }
   return { width: logicalWidth, height: logicalHeight, rotate }
+}
+
+function touchRotationForVideo(videoRotation, systemConfig) {
+  if (!systemConfig) {
+    return normalizeRotation(videoRotation, 0)
+  }
+  const nativeVideo = normalizeRotation(systemConfig.videoRotation, 0)
+  const nativeTouch = normalizeRotation(systemConfig.touchRotation, nativeVideo)
+  const composed = (normalizeRotation(videoRotation, 0) + nativeTouch - nativeVideo + 360) % 360
+  return normalizeRotation(composed, normalizeRotation(videoRotation, 0))
 }
 
 function generatePairPin() {
@@ -352,6 +398,7 @@ export default {
       touchMode: 'screen',
       screenWidth: DEFAULT_SCREEN_WIDTH,
       screenHeight: DEFAULT_SCREEN_HEIGHT,
+      systemDisplayConfig: null,
     }
   },
   computed: {
@@ -458,10 +505,11 @@ export default {
   },
   methods: {
     updateScreenSize() {
-      const size = readDeviceSize()
+      this.systemDisplayConfig = readSystemDisplayConfig()
+      const size = readDeviceSize(this.systemDisplayConfig)
       this.screenWidth = size.width
       this.screenHeight = size.height
-      console.warn(`moonlight settings screen ${this.screenWidth}x${this.screenHeight}`)
+      console.warn(`moonlight settings screen ${this.screenWidth}x${this.screenHeight} source ${this.systemDisplayConfig ? this.systemDisplayConfig.source : 'fallback'}`)
     },
     registerKeyboard() {
       try {
@@ -888,13 +936,16 @@ export default {
         return
       }
       const geometry = moonlightGeometry(this.targetWidth, this.targetHeight, this.rotate)
+      const display = this.systemDisplayConfig || {}
+      const fpsMax = positiveInt(display.fpsMax, 0)
+      const streamFps = fpsMax > 0 ? Math.min(this.fps, fpsMax) : this.fps
       console.warn('moonlight navigate to blank frame')
       $falcon.navTo('frame', {
         host: this.selectedHostAddress,
         app: 'Desktop',
         width: geometry.width,
         height: geometry.height,
-        fps: this.fps,
+        fps: streamFps,
         bitrate: this.bitrate,
         packetSize: 1024,
         remote: 'yes',
@@ -902,6 +953,10 @@ export default {
         viewOnly: this.viewOnly,
         stretch: this.stretch,
         touchMode: this.touchMode,
+        touchDevice: display.touchDevice || '',
+        touchRotation: touchRotationForVideo(geometry.rotate, display),
+        touchOffsetX: Number(display.touchOffsetX) || 0,
+        touchOffsetY: Number(display.touchOffsetY) || 0,
       })
     },
   },

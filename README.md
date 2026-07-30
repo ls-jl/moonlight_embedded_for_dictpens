@@ -51,6 +51,7 @@ Implemented behavior includes:
 
 - MPP hardware decoding.
 - DRM plane presentation.
+- A latest-wins frame mailbox that retains MPP frames until DRM vblank, preventing decoder-buffer reuse during scanout.
 - DRM plane rotation when supported.
 - RGA hardware rotation fallback for `90`, `180`, and `270` degree output.
 - No CPU rotation fallback.
@@ -59,7 +60,10 @@ Implemented behavior includes:
 The input changes are mainly in `moonlight-embedded-master/src/input/evdev.c`:
 
 - Touch screen mode.
+- Multi-touch MT slots in screen mode, with cancel-all handling on shutdown and device removal.
 - Touchpad mode with relative mouse behavior.
+- Touchpad coordinates normalized to a `0..4095` reference over the active ABS range.
+- Physical touch-device, rotation, and offset configuration from `/etc/miniapp/resources/cfg.json`, excluding controller touch surfaces.
 - Gamepad hotplug rescan.
 - DualShock 4 fallback mapping.
 - Sony gamepad reporting as an Xbox controller for host compatibility.
@@ -73,6 +77,7 @@ The native miniapp bridge is in `jsapi/src/jsapi_rgbframe/JSRgbFramePlayer.cpp`:
 - Switches RK USB OTG into host mode for input mode.
 - Re-applies Wi-Fi and USB runtime power settings during streaming.
 - Passes stream options from miniapp JS to Moonlight CLI arguments.
+- Resolves panel dimensions and `fps_max` from system configuration, then falls back to Falcon dimensions and DRM mode.
 
 ## Project Layout
 

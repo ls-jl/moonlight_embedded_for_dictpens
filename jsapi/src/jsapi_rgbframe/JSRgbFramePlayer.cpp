@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <signal.h>
+#include <sstream>
 #include <string>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -438,6 +439,57 @@ static bool readDrmScreenSize(DrmScreenSize &size)
     return false;
 }
 
+static std::string readTextFile(const char *path)
+{
+    std::ifstream input(path);
+    if (!input.good()) {
+        return "";
+    }
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
+static int normalizeRotationValue(int rotation, int fallback)
+{
+    switch (rotation) {
+    case 0:
+    case 90:
+    case 180:
+    case 270:
+        return rotation;
+    default:
+        return fallback;
+    }
+}
+
+static std::string jsonEscape(const std::string &value)
+{
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (char ch : value) {
+        switch (ch) {
+        case '\\':
+            escaped += "\\\\";
+            break;
+        case '"':
+            escaped += "\\\"";
+            break;
+        case '\n':
+            escaped += "\\n";
+            break;
+        case '\r':
+            escaped += "\\r";
+            break;
+        case '\t':
+            escaped += "\\t";
+            break;
+        default:
+            escaped += ch;
+            break;
+        }
+    }
+    return escaped;
+}
+
 }  // namespace
 
 JSRgbFramePlayer::JSRgbFramePlayer()
@@ -602,6 +654,68 @@ void JSRgbFramePlayer::getDrmScreenSize(JQFunctionInfo &info)
     info.GetReturnValue().Set(std::to_string(screen.width) + "x" + std::to_string(screen.height));
 }
 
+void JSRgbFramePlayer::getSystemDisplayConfig(JQFunctionInfo &info)
+{
+    JSContext *ctx = info.GetContext();
+    const std::string text = readTextFile("/etc/miniapp/resources/cfg.json");
+    JSValue config = JS_UNDEFINED;
+    if (!text.empty()) {
+        config = JS_ParseJSON(ctx, text.c_str(), text.size(), "/etc/miniapp/resources/cfg.json");
+        if (JS_IsException(config)) {
+            JS_FreeValue(ctx, config);
+            config = JS_UNDEFINED;
+        }
+    }
+
+    const int width = getIntPropertyAllowZero(ctx, config, "width", 0);
+    const int height = getIntPropertyAllowZero(ctx, config, "height", 0);
+    const int frameworkRotation = normalizeRotationValue(
+        getIntPropertyAllowZero(ctx, config, "direction", 0), 0);
+    const int videoRotation = normalizeRotationValue(
+        getIntPropertyAllowZero(ctx, config, "video_direction", frameworkRotation),
+        frameworkRotation);
+    const int touchRotation = normalizeRotationValue(
+        getIntPropertyAllowZero(ctx, config, "tp_direction", videoRotation),
+        videoRotation);
+    const int touchOffsetX = getIntPropertyAllowZero(ctx, config, "tp_xoffset", 0);
+    const int touchOffsetY = getIntPropertyAllowZero(ctx, config, "tp_yoffset", 0);
+    const int fpsMax = getIntPropertyAllowZero(ctx, config, "fps_max", 0);
+    const std::string touchDevice = getStringProperty(ctx, config, "tp", "");
+    JS_FreeValue(ctx, config);
+
+    int panelWidth = width;
+    int panelHeight = height;
+    if ((videoRotation == 90 || videoRotation == 270) &&
+        panelWidth > 0 && panelHeight > 0 && panelWidth < panelHeight) {
+        std::swap(panelWidth, panelHeight);
+    }
+
+    DrmScreenSize drm;
+    const std::string drmMode = readDrmScreenSize(drm)
+        ? std::to_string(drm.width) + "x" + std::to_string(drm.height)
+        : "";
+    const std::string panelSize = panelWidth > 0 && panelHeight > 0
+        ? std::to_string(panelWidth) + "x" + std::to_string(panelHeight)
+        : "";
+
+    std::ostringstream output;
+    output << "{"
+           << "\"source\":\"" << (text.empty() ? "missing" : "system_cfg") << "\","
+           << "\"width\":" << width << ","
+           << "\"height\":" << height << ","
+           << "\"panelSize\":\"" << jsonEscape(panelSize) << "\","
+           << "\"frameworkRotation\":" << frameworkRotation << ","
+           << "\"videoRotation\":" << videoRotation << ","
+           << "\"touchRotation\":" << touchRotation << ","
+           << "\"touchOffsetX\":" << touchOffsetX << ","
+           << "\"touchOffsetY\":" << touchOffsetY << ","
+           << "\"fpsMax\":" << fpsMax << ","
+           << "\"drmMode\":\"" << jsonEscape(drmMode) << "\","
+           << "\"touchDevice\":\"" << jsonEscape(touchDevice) << "\""
+           << "}";
+    info.GetReturnValue().Set(output.str());
+}
+
 pid_t JSRgbFramePlayer::startMoonlightProcess(JQFunctionInfo &info)
 {
     stopMoonlightProcess();
@@ -630,6 +744,11 @@ pid_t JSRgbFramePlayer::startMoonlightProcess(JQFunctionInfo &info)
     bool takeover = getBoolProperty(ctx, options, "takeover", true);
     std::string remote = getStringProperty(ctx, options, "remote", "yes");
     std::string touchMode = getStringProperty(ctx, options, "touchMode", "screen");
+    std::string touchDevice = getStringProperty(ctx, options, "touchDevice", "");
+    int touchRotation = normalizeRotationValue(
+        getIntPropertyAllowZero(ctx, options, "touchRotation", rotate), rotate);
+    int touchOffsetX = getIntPropertyAllowZero(ctx, options, "touchOffsetX", 0);
+    int touchOffsetY = getIntPropertyAllowZero(ctx, options, "touchOffsetY", 0);
     if (touchMode != "touchpad") {
         touchMode = "screen";
     }
@@ -736,6 +855,17 @@ pid_t JSRgbFramePlayer::startMoonlightProcess(JQFunctionInfo &info)
         setenv("MOONLIGHT_RK_DRM_TAKEOVER", takeover ? "1" : "0", 1);
         setenv("MOONLIGHT_RK_DRM_ZPOS", "3", 0);
         setenv("MOONLIGHT_RK_TOUCH_MODE", touchMode.c_str(), 1);
+        if (!touchDevice.empty()) {
+            setenv("MOONLIGHT_RK_TOUCH_DEVICE", touchDevice.c_str(), 1);
+        } else {
+            unsetenv("MOONLIGHT_RK_TOUCH_DEVICE");
+        }
+        const std::string touchRotationEnv = std::to_string(touchRotation);
+        const std::string touchOffsetXEnv = std::to_string(touchOffsetX);
+        const std::string touchOffsetYEnv = std::to_string(touchOffsetY);
+        setenv("MOONLIGHT_RK_TOUCH_ROTATION", touchRotationEnv.c_str(), 1);
+        setenv("MOONLIGHT_RK_TOUCH_OFFSET_X", touchOffsetXEnv.c_str(), 1);
+        setenv("MOONLIGHT_RK_TOUCH_OFFSET_Y", touchOffsetYEnv.c_str(), 1);
         if (!viewOnly) {
             setenv("MOONLIGHT_RK_EXPECT_GAMEPAD", "1", 1);
         } else {
@@ -1250,6 +1380,7 @@ static JSValue createRgbFramePlayer(JQModuleEnv *env)
     tpl->SetProtoMethod("isMoonlightRunning", &JSRgbFramePlayer::isMoonlightRunning);
     tpl->SetProtoMethod("pairMoonlight", &JSRgbFramePlayer::pairMoonlight);
     tpl->SetProtoMethod("getDrmScreenSize", &JSRgbFramePlayer::getDrmScreenSize);
+    tpl->SetProtoMethod("getSystemDisplayConfig", &JSRgbFramePlayer::getSystemDisplayConfig);
     tpl->InstanceTemplate()->Set("onDrawFrame", &JSRgbFramePlayer::onDrawFrame);
     return tpl->CallConstructor();
 }

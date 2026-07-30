@@ -22,6 +22,7 @@
 extern int evdev_gamepads;
 
 void evdev_create(const char* device, struct mapping* mappings, bool verbose, int rotate);
+void evdev_configure_touch_from_env(void);
 void evdev_scan_devices(struct mapping* mappings, bool verbose, int rotate);
 void evdev_loop();
 

@@ -26,6 +26,10 @@ const DEFAULT_MOONLIGHT_OPTIONS = {
   takeover: true,
   otgHost: false,
   touchMode: 'screen',
+  touchDevice: '',
+  touchRotation: 0,
+  touchOffsetX: 0,
+  touchOffsetY: 0,
   volumeBaseline: -1,
 }
 
@@ -37,6 +41,11 @@ function toInt(value, fallback) {
 function evenDimension(value) {
   const parsed = toInt(value, 2)
   return Math.max(2, parsed - (parsed % 2))
+}
+
+function toNonNegativeInt(value, fallback) {
+  const parsed = parseInt(value, 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
 }
 
 function readDeviceSize() {
@@ -191,6 +200,10 @@ export default {
         takeover: true,
         otgHost: !viewOnly,
         touchMode: normalizeTouchMode(options.touchMode || DEFAULT_MOONLIGHT_OPTIONS.touchMode),
+        touchDevice: options.touchDevice || DEFAULT_MOONLIGHT_OPTIONS.touchDevice,
+        touchRotation: toNonNegativeInt(options.touchRotation, toNonNegativeInt(options.rotate, DEFAULT_MOONLIGHT_OPTIONS.touchRotation)),
+        touchOffsetX: toNonNegativeInt(options.touchOffsetX, DEFAULT_MOONLIGHT_OPTIONS.touchOffsetX),
+        touchOffsetY: toNonNegativeInt(options.touchOffsetY, DEFAULT_MOONLIGHT_OPTIONS.touchOffsetY),
         volumeBaseline: volumeBaseline >= 0 ? volumeBaseline : DEFAULT_MOONLIGHT_OPTIONS.volumeBaseline,
       }
     },

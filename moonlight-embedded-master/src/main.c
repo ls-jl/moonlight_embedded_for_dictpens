@@ -389,6 +389,7 @@ int main(int argc, char* argv[]) {
           mappings = map;
         }
 
+        evdev_configure_touch_from_env();
         for (int i=0;i<config.inputsCount;i++) {
           if (config.debug_level > 0)
             printf("Adding input device %s...\n", config.inputs[i]);

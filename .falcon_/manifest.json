@@ -29,42 +29,34 @@
       "md5": "c9be6ef6da5b1aa363e294d804b1bc92"
     },
     "frame.js.bin": {
-      "size": 7200,
-      "md5": "a9c6f544d2aa11118c2be0c6a3d1025a"
+      "size": 7506,
+      "md5": "f4403a95b03744bc28ba17c5fadf4cf1"
     },
     "index.js.bin": {
-      "size": 24999,
-      "md5": "ef688b254bca492abe1d288b29dc1a8f"
+      "size": 26183,
+      "md5": "3a1a765f70daec27f8ef45aca570e612"
     },
     "libs/libjsapi_rgbframe_12345.so": {
-      "size": 4647264,
-      "md5": "ea0fcd9adee9c3d596c6e9c5670b8136"
+      "size": 4667776,
+      "md5": "cdf37954a2a54074d1fbc904c3578ff0"
     },
     "libs/arm64-orange/libjsapi_rgbframe.so": {
-      "size": 4647264,
-      "md5": "ea0fcd9adee9c3d596c6e9c5670b8136"
+      "size": 4667776,
+      "md5": "cdf37954a2a54074d1fbc904c3578ff0"
     },
     "assets/moonlight-rk3562/libmoonlight-rk.so": {
-      "size": 49208,
-      "md5": "947e3c2443247c5bbc7b584ae3804804"
-    },
-    "assets/moonlight-rk3562/moonlight": {
-      "size": 89176,
-      "md5": "d825b0161e062310d904928267e7e3e8"
+      "size": 53848,
+      "md5": "f294e11fc831e5acb15daad0d4ba8369"
     },
     "assets/moonlight-rk3562/moonlight-rk3562": {
       "size": 163,
       "md5": "5bcfa14ec89e51bea7a7c463d5622d92"
     },
+    "assets/moonlight-rk3562/moonlight": {
+      "size": 94080,
+      "md5": "6369493c0078b74b770a968c22cb1570"
+    },
     "assets/moonlight-rk3562/libgamestream/libgamestream.so": {
-      "size": 138520,
-      "md5": "11be6f5bdea59034bfa6f2cfa28f0d4b"
-    },
-    "assets/moonlight-rk3562/libgamestream/libgamestream.so.2.7.1": {
-      "size": 138520,
-      "md5": "11be6f5bdea59034bfa6f2cfa28f0d4b"
-    },
-    "assets/moonlight-rk3562/libgamestream/libgamestream.so.4": {
       "size": 138520,
       "md5": "11be6f5bdea59034bfa6f2cfa28f0d4b"
     },
@@ -72,13 +64,21 @@
       "size": 216800,
       "md5": "9fd11419a9d27e947a395698a41ee834"
     },
-    "assets/moonlight-rk3562/libgamestream/libmoonlight-common.so.2.7.1": {
-      "size": 216800,
-      "md5": "9fd11419a9d27e947a395698a41ee834"
+    "assets/moonlight-rk3562/libgamestream/libgamestream.so.2.7.1": {
+      "size": 138520,
+      "md5": "11be6f5bdea59034bfa6f2cfa28f0d4b"
     },
     "assets/moonlight-rk3562/libgamestream/libmoonlight-common.so.4": {
       "size": 216800,
       "md5": "9fd11419a9d27e947a395698a41ee834"
+    },
+    "assets/moonlight-rk3562/libgamestream/libmoonlight-common.so.2.7.1": {
+      "size": 216800,
+      "md5": "9fd11419a9d27e947a395698a41ee834"
+    },
+    "assets/moonlight-rk3562/libgamestream/libgamestream.so.4": {
+      "size": 138520,
+      "md5": "11be6f5bdea59034bfa6f2cfa28f0d4b"
     }
   }
 }
